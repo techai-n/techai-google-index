@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://techai-n.github.io/techai-google-index/sitemap.xml
