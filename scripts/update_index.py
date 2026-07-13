@@ -146,7 +146,9 @@ def load_archive(recent_posts: list[Post]) -> list[Post]:
             raise RuntimeError("Naver archive exceeded the 100-page safety limit")
     if expected_total is None or len(archive) != expected_total:
         raise RuntimeError(f"Incomplete Naver archive: expected {expected_total}, received {len(archive)}")
-    return sorted(archive.values(), key=lambda post: (post.published, post.log_no), reverse=True)
+    # The API already returns the blog's authoritative newest-first order.
+    # Preserve it instead of guessing within-day order from dates or log IDs.
+    return list(archive.values())
 
 
 def keywords(post: Post) -> list[str]:
@@ -227,19 +229,50 @@ def render_card(post: Post, position: int) -> str:
 '''
 
 
-def update_index(document: str, new_posts: list[Post], total: int, updated: str) -> str:
-    added = len(new_posts)
-    document = re.sub(r'("position":\s*)(\d+)', lambda m: m.group(1) + str(int(m.group(2)) + added), document)
-    document = re.sub(
-        r'(<div class="post-meta">\s*<span>)(\d{3})(</span>)',
-        lambda m: m.group(1) + f"{int(m.group(2)) + added:03d}" + m.group(3), document,
+def index_post_ids(document: str) -> list[str]:
+    return re.findall(r'<h3><a href="posts/(\d+)/">', document)
+
+
+def update_index(document: str, posts: list[Post], updated: str) -> str:
+    card_pattern = re.compile(r'      <article class="post-card">.*?      </article>\n', re.DOTALL)
+    cards: dict[str, str] = {}
+    for card in card_pattern.findall(document):
+        match = re.search(r'<h3><a href="posts/(\d+)/">', card)
+        if match:
+            cards[match.group(1)] = card
+
+    ordered_cards = []
+    for position, post in enumerate(posts, 1):
+        card = cards.get(post.log_no, render_card(post, position))
+        card = re.sub(
+            r'(<div class="post-meta">\s*<span>)\d+(</span>)',
+            rf'\g<1>{position:03d}\g<2>', card, count=1,
+        )
+        ordered_cards.append(card)
+    document, replacements = re.subn(
+        r'(      <div class="post-grid">\n).*?(      </div>\n    </section>)',
+        lambda match: match.group(1) + "".join(ordered_cards) + match.group(2),
+        document, count=1, flags=re.DOTALL,
     )
-    json_items = "".join(
-        "        " + json.dumps({"@type": "ListItem", "position": position, "name": post.title, "url": post.page_url}, ensure_ascii=False) + ",\n"
-        for position, post in enumerate(new_posts, 1)
+    if replacements != 1:
+        raise RuntimeError("Could not replace the post grid in index.html")
+
+    json_items = "\n".join(
+        "        " + json.dumps(
+            {"@type": "ListItem", "position": position, "name": post.title, "url": post.page_url},
+            ensure_ascii=False,
+        ) + ("," if position < len(posts) else "")
+        for position, post in enumerate(posts, 1)
     )
-    document = document.replace('      "itemListElement": [\n', '      "itemListElement": [\n' + json_items, 1)
-    document = document.replace('      <div class="post-grid">\n', '      <div class="post-grid">\n' + "".join(render_card(post, position) for position, post in enumerate(new_posts, 1)), 1)
+    document, replacements = re.subn(
+        r'(      "itemListElement": \[\n).*?(\n      \])',
+        lambda match: match.group(1) + json_items + match.group(2),
+        document, count=1, flags=re.DOTALL,
+    )
+    if replacements != 1:
+        raise RuntimeError("Could not replace ItemList JSON-LD in index.html")
+
+    total = len(posts)
     document = re.sub(r'("numberOfItems":\s*)\d+', rf'\g<1>{total}', document, count=1)
     document = re.sub(r'(전체 공개 포스팅 )\d+(개)', rf'\g<1>{total}\g<2>', document, count=1)
     document = re.sub(r'(<div class="stat"><strong>)\d+(</strong><span>전체 공개 포스팅)', rf'\g<1>{total}\g<2>', document, count=1)
@@ -248,20 +281,24 @@ def update_index(document: str, new_posts: list[Post], total: int, updated: str)
     return document
 
 
-def update_sitemap(document: str, new_posts: list[Post], updated: str) -> str:
-    document = re.sub(r'(<loc>' + re.escape(BASE_URL) + r'</loc>\s*<lastmod>)\d{4}-\d{2}-\d{2}', rf'\g<1>{updated}', document, count=1)
+def render_sitemap(posts: list[Post], updated: str) -> str:
     entries = "".join(f'''  <url>
     <loc>{post.page_url}</loc>
     <lastmod>{post.published}</lastmod>
     <changefreq>weekly</changefreq>
     <priority>0.8</priority>
   </url>
-''' for post in new_posts)
-    first_end = document.find("  </url>")
-    if first_end < 0:
-        raise RuntimeError("Could not find the root URL in sitemap.xml")
-    insert_at = first_end + len("  </url>\n")
-    return document[:insert_at] + entries + document[insert_at:]
+''' for post in posts)
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>{BASE_URL}</loc>
+    <lastmod>{updated}</lastmod>
+    <changefreq>daily</changefreq>
+    <priority>1.0</priority>
+  </url>
+{entries}</urlset>
+'''
 
 
 def main() -> int:
@@ -278,21 +315,26 @@ def main() -> int:
     post_root = ROOT / "posts"
     existing_ids = {path.name for path in post_root.iterdir() if path.is_dir() and (path / "index.html").is_file()}
     new_posts = [post for post in archive_posts if post.log_no not in existing_ids]
-    print(f"RSS posts: {len(feed_posts)}, archive posts: {len(archive_posts)}, existing posts: {len(existing_ids)}, new posts: {len(new_posts)}")
-    if args.check or not new_posts:
+    index_path = ROOT / "index.html"
+    index_document = index_path.read_text(encoding="utf-8")
+    expected_order = [post.log_no for post in archive_posts]
+    order_changed = index_post_ids(index_document) != expected_order
+    print(f"RSS posts: {len(feed_posts)}, archive posts: {len(archive_posts)}, existing posts: {len(existing_ids)}, new posts: {len(new_posts)}, reorder needed: {order_changed}")
+    if args.check or (not new_posts and not order_changed):
         return 0
 
     updated = datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Seoul")).date().isoformat()
-    for position, post in enumerate(new_posts):
+    archive_positions = {post.log_no: position for position, post in enumerate(archive_posts)}
+    for post in new_posts:
+        position = archive_positions[post.log_no]
         path = post_root / post.log_no / "index.html"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(render_post(post, new_posts[position - 1] if position else None, new_posts[position + 1] if position + 1 < len(new_posts) else None, updated), encoding="utf-8")
+        path.write_text(render_post(post, archive_posts[position - 1] if position else None, archive_posts[position + 1] if position + 1 < len(archive_posts) else None, updated), encoding="utf-8")
 
-    index_path = ROOT / "index.html"
     sitemap_path = ROOT / "sitemap.xml"
-    index_path.write_text(update_index(index_path.read_text(encoding="utf-8"), new_posts, len(existing_ids) + len(new_posts), updated), encoding="utf-8")
-    sitemap_path.write_text(update_sitemap(sitemap_path.read_text(encoding="utf-8"), new_posts, updated), encoding="utf-8")
-    print(f"Updated {len(existing_ids) + len(new_posts)} indexed posts ({len(new_posts)} newly created).")
+    index_path.write_text(update_index(index_document, archive_posts, updated), encoding="utf-8")
+    sitemap_path.write_text(render_sitemap(archive_posts, updated), encoding="utf-8")
+    print(f"Updated {len(archive_posts)} indexed posts ({len(new_posts)} newly created).")
     return 0
 
 
