@@ -30,8 +30,16 @@ This folder is ready to publish as a GitHub Pages site.
 
 ## Update Posts
 
-Regenerate the site from the public Naver post list so the index page,
-per-post pages, and sitemap stay in sync.
+The `Update blog index` GitHub Actions workflow runs every day at 00:00 KST.
+It reads the public Naver RSS feed, adds newly published post pages, and keeps
+the main index and sitemap in sync. It can also be run manually from the
+repository's `Actions` tab.
+
+To run the same updater locally:
+
+```bash
+python3 scripts/update_index.py
+```
 
 Each generated post page should keep:
 
